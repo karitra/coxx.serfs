@@ -3,8 +3,10 @@
 #include <cocaine/framework/service.hpp>
 #include <cocaine/framework/channel.hpp>
 #include <cocaine/framework/manager.hpp>
-//#include <cocaine/traits/error_code.hpp>
+
 #include <cocaine/idl/node.hpp>
+
+#include "detail/cxxopts.hpp"
 
 
 using namespace cocaine;
@@ -27,12 +29,10 @@ auto mass_requests(Application&& client, const int iters, const std::string&even
     using send_future = fw::task<fw::channel<io::app::enqueue>::sender_type>::future_move_type;
 
     using chunk_future = fw::task<boost::optional<std::string>>::future_move_type;
-    using choke_future = chunk_future;
-
-    using rx_type = fw::channel<io::app::enqueue>::receiver_type;
+    // using choke_future = chunk_future;
+    // using rx_type = fw::channel<io::app::enqueue>::receiver_type;
 
     for(int i = 0; i < iters; ++i) {
-        // client.template invoke<io::app::enqueue>(event);
         auto f = client.template invoke<io::app::enqueue>(event)
             .then([&](invoke_future future) {
                 auto ch = future.get();
@@ -77,20 +77,31 @@ auto mass_requests(Application&& client, const int iters, const std::string&even
     }
 }
 
-auto main(int argc, char *argv[]) -> int {
+auto main(int argc, const char **argv) -> int {
     fw::service_manager_t manager(DEFAULT_THREADS_COUNT);
 
-    auto echo = manager.create<cocaine::io::app_tag>("Echo4");
+    cxxopts::Options options("cli.t1", "Sample Cocaine native framework based serf");
+    options.add_options()
+        ("n,name", "service name")
+        ("m,method", "service method to call")
+        ("d,data", "message to send")
+        ("i,iters", "number of requests");
 
-    std::cout << "Sample 'Echo' client.\n";
+    auto options_parsed = options.parse(argc, argv);
 
-    echo.connect().then(+[] (fw::task<void>::future_move_type f) -> void {
+    const auto app_name = options_parsed["name"].as<std::string>();
+    const auto method_name = options_parsed["method"].as<std::string>();
+    const auto iters = options_parsed["iters"].as<int>();
+
+    auto cli = manager.create<cocaine::io::app_tag>(app_name);
+
+    cli.connect().then(+[] (fw::task<void>::future_move_type f) -> void {
         f.get();
         std::cerr << "connected!\n";
     });
 
     try {
-        mass_requests(echo, ITERS, "meta", "message");
+        mass_requests(cli, iters, method_name, "message");
     } catch(const std::exception& e) {
         std::cerr << "error: " << e.what() << '\n';
     }
