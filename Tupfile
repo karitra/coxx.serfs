@@ -1,0 +1,17 @@
+CXX = g++
+#CXX = clang++-4.0
+CXXFLAGS = -std=c++1y -O2 -g -fomit-frame-pointer
+
+COX_INCL = "../coxx-plugins/node/include"
+COX_FWINCL = "../coxx-framework-native/include"
+COX_FWLINK = "../coxx-framework-native/build/src"
+COX_FWLIB = -lcocaine-framework-native  -lcocaine-io-util
+
+BOOST_LIBS = -lboost_system
+
+BLACKHOLE_LIBS = -lblackhole
+
+LIBS = $(COX_FWLIB) $(BOOST_LIBS) $(BLACKHOLE_LIBS)
+
+: src/t1.cc |> $(CXX) $(CXXFLAGS) -I$(COX_FWINCL) -I$(COX_INCL) %f -L$(COX_FWLINK) $(LIBS) -o %o |> build/cli.t1
+
