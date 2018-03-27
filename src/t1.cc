@@ -1,4 +1,7 @@
 #include <iostream>
+#include <functional>
+
+#include <cstdlib>
 
 #include <cocaine/framework/service.hpp>
 #include <cocaine/framework/channel.hpp>
@@ -6,17 +9,84 @@
 
 #include <cocaine/idl/node.hpp>
 
-#include "detail/cxxopts.hpp"
+#include "detail/argagg.hpp"
+
+#if 1
+#define dbg(msg) std::cerr << msg << '\n'
+#else
+#define dbg(msg)
+#endif
 
 
 using namespace cocaine;
 namespace fw = cocaine::framework;
+namespace ph = std::placeholders;
 
 using scope = io::protocol<io::app::enqueue::dispatch_type>::scope;
 
+constexpr int DEFAULT_THREADS_COUNT = 1; //1 << 7;
+constexpr int ITERS = 1;
 
-constexpr int DEFAULT_THREADS_COUNT = 1 << 7;
-constexpr int ITERS = 3;
+using void_future = fw::task<void>::future_type;
+using void_move_future = fw::task<void>::future_move_type;
+
+using invoke_move_future = fw::task<fw::channel<io::app::enqueue>>::future_move_type;
+using send_move_future = fw::task<fw::channel<io::app::enqueue>::sender_type>::future_move_type;
+
+using chunk_future = fw::task<boost::optional<std::string>>::future_type;
+using choke_future = chunk_future;
+
+using chunk_move_future = fw::task<boost::optional<std::string>>::future_move_type;
+using choke_move_future = chunk_move_future;
+
+using rx_type = fw::channel<io::app::enqueue>::receiver_type;
+
+
+namespace app {
+
+    auto on_send(send_move_future future, rx_type rx) -> chunk_future {
+        dbg("[send]");
+        auto r = future.get();
+        return rx.recv();
+    }
+
+    auto on_chunk(chunk_move_future future, rx_type rx) -> chunk_future {
+        dbg("[chunk]");
+
+        auto result = future.get();
+        if (!result) {
+            throw std::runtime_error("the `result` must be true");
+        }
+
+        dbg("[chunk] result " << result);
+        return rx.recv();
+    }
+
+    auto on_choke(choke_move_future future) -> void {
+        dbg("[choke]");
+        auto result = future.get();
+        dbg("[choke] result " << result);
+    }
+
+    auto on_invoke(invoke_move_future future, const std::string& message) -> void_future {
+
+        auto ch = future.get();
+
+        auto rx = std::move(ch.rx);
+        auto tx = std::move(ch.tx);
+
+        dbg("[invoke]");
+        return tx.send<scope::chunk>(message)
+            .then(std::bind(on_send, ph::_1, rx))
+            .then(std::bind(on_chunk, ph::_1, rx))
+            .then(std::bind(on_choke, ph::_1));
+    }
+
+    auto on_finalize(void_move_future future) -> void {
+        dbg("[finalize]");
+        future.get();
+    }
+}
 
 
 template<typename Application>
@@ -25,51 +95,12 @@ auto mass_requests(Application&& client, const int iters, const std::string&even
     std::vector<task_type> completions;
     completions.reserve(ITERS);
 
-    using invoke_future = fw::task<fw::channel<io::app::enqueue>>::future_move_type;
-    using send_future = fw::task<fw::channel<io::app::enqueue>::sender_type>::future_move_type;
-
-    using chunk_future = fw::task<boost::optional<std::string>>::future_move_type;
-    // using choke_future = chunk_future;
-    // using rx_type = fw::channel<io::app::enqueue>::receiver_type;
-
     for(int i = 0; i < iters; ++i) {
         auto f = client.template invoke<io::app::enqueue>(event)
-            .then([&](invoke_future future) {
-                auto ch = future.get();
+            .then(std::bind(app::on_invoke, ph::_1, message))
+            .then(std::bind(app::on_finalize, ph::_1));
 
-                auto rx = std::move(ch.rx);
-                auto tx = std::move(ch.tx);
-
-                return tx.send<scope::chunk>(message)
-                    .then([rx = std::move(rx)](send_future future) mutable {
-                        std::cerr << "on send\n";
-                        try {
-                            future.get();
-                        } catch (const std::exception& e) {
-                            std::cerr << "send error: " << e.what() << '\n';
-                        }
-                        return rx.recv();
-                    })
-                    .then([rx = std::move(rx)](chunk_future future) mutable {
-                        std::cerr << "on chunk\n";
-                        try {
-                            auto result = future.get();
-                            if (!result) {
-                                throw std::runtime_error("result must be true");
-                            }
-                            std::cerr << "result " << result << '\n';
-                        } catch(const std::exception& e) {
-                            std::cerr << "error: " << e.what() << '\n';
-                            throw;
-                        }
-                        return rx.recv();
-                    })
-                    .then([](chunk_future future){
-                        future.get();
-                    });
-            });
-
-        // completions.push_back(std::move(f));
+        completions.push_back(std::move(f));
     }
 
     for(auto& f: completions) {
@@ -77,34 +108,33 @@ auto mass_requests(Application&& client, const int iters, const std::string&even
     }
 }
 
-auto main(int argc, const char **argv) -> int {
+auto main(int argc, const char **argv) -> int try {
+    argagg::parser argparser {{
+        {"name", {"-n", "--name"}, "service name", 1},
+        {"method", {"-m", "--method"}, "service method to call", 1},
+        {"payload", {"-d","--data"}, "message to send", 1},
+        {"iters", {"-i","--iters"}, "number of requests", 1}
+    }};
+
+    auto args = argparser.parse(argc, argv);
+
+    const auto app_name = args["name"].as<std::string>("Echo4");
+    const auto method_name = args["method"].as<std::string>("ping");
+    const auto iters = args["iters"].as<int>(ITERS);
+
     fw::service_manager_t manager(DEFAULT_THREADS_COUNT);
-
-    cxxopts::Options options("cli.t1", "Sample Cocaine native framework based serf");
-    options.add_options()
-        ("n,name", "service name")
-        ("m,method", "service method to call")
-        ("d,data", "message to send")
-        ("i,iters", "number of requests");
-
-    auto options_parsed = options.parse(argc, argv);
-
-    const auto app_name = options_parsed["name"].as<std::string>();
-    const auto method_name = options_parsed["method"].as<std::string>();
-    const auto iters = options_parsed["iters"].as<int>();
-
     auto cli = manager.create<cocaine::io::app_tag>(app_name);
 
-    cli.connect().then(+[] (fw::task<void>::future_move_type f) -> void {
+    cli.connect().then([&] (void_move_future f) {
         f.get();
         std::cerr << "connected!\n";
     });
 
-    try {
-        mass_requests(cli, iters, method_name, "message");
-    } catch(const std::exception& e) {
-        std::cerr << "error: " << e.what() << '\n';
-    }
+    mass_requests(cli, iters, method_name, "message");
 
     std::cout << "Have a nice day.\n";
+    return EXIT_SUCCESS;
+} catch(const std::exception& e) {
+    std::cerr << "[error] " << e.what() << '\n';
+    return EXIT_FAILURE;
 }
