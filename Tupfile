@@ -1,6 +1,6 @@
 CXX = g++
 #CXX = clang++-4.0
-CXXFLAGS = -Wall -std=c++1y -O2 -g -fomit-frame-pointer
+CXXFLAGS = -Wall -std=c++1y -O2 -g
 
 PRJ_INCL = "./src/detail"
 COX_INCL = "../coxx-plugins/node/include"
