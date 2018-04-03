@@ -1,5 +1,6 @@
 #include <iostream>
 #include <functional>
+#include <memory>
 #include <thread>
 #include <chrono>
 
@@ -12,6 +13,7 @@
 #include <cocaine/idl/node.hpp>
 
 #include "detail/argagg.hpp"
+
 
 #if 0
 #define dbg(msg) std::cerr << msg << '\n'
@@ -40,58 +42,90 @@ using choke_future = chunk_future;
 
 using chunk_move_future = fw::task<boost::optional<std::string>>::future_move_type;
 using choke_move_future = chunk_move_future;
+using error_move_future = fw::task<void>::future_move_type;
 
 using rx_type = fw::channel<io::app::enqueue>::receiver_type;
 
 
 namespace app {
 
-    auto on_send(send_move_future future, rx_type rx) -> chunk_future {
-        dbg("[send]");
-        future.get();
-        dbg("[send] done");
-        return rx.recv();
+    auto on_send(send_move_future future, rx_type rx, const int num) -> chunk_future {
+        dbg("[send] " << num);
+        try {
+            future.get();
+        } catch(const std::exception& e) {
+            dbg("[send] error " << num << ' ' << e.what());
+            throw;
+        }
+        auto f = rx.recv();
+        dbg("[send] done " << num);
+        return f;
     }
 
-    auto on_chunk(chunk_move_future future, rx_type rx) -> chunk_future {
-        dbg("[chunk]");
+    auto on_chunk(chunk_move_future future, rx_type rx, const int num) -> chunk_future {
+        dbg("[chunk] " << num);
 
-        auto result = future.get();
-        if (!result) {
-            throw std::runtime_error("[chunk] the `result` must be set");
+        try {
+            auto result = future.get();
+            if (!result) {
+                throw std::runtime_error("[chunk] the `result` must be set");
+            }
+            dbg("[chunk] result " << num << ' ' << *result);
+        } catch(const std::exception& e) {
+            dbg("[chunk] error " << num << e.what());
+            throw;
         }
 
-        dbg("[chunk] result " << *result);
-        return rx.recv();
+        auto f = rx.recv();
+        dbg("[chunk] done " << num);
+        return f;
     }
 
-    auto on_choke(choke_move_future future) -> void {
-        dbg("[choke]");
-        auto result = future.get();
-        if (!result) {
-            dbg("[choke] no result");
-        } else {
-            dbg("[choke] result " << *result);
+    auto on_choke(choke_move_future future, const int num) -> void {
+        dbg("[choke] " << num);
+        try {
+            auto result = future.get();
+            if (!result) {
+                dbg("[choke] done " << num);
+            } else {
+                dbg("[choke] result " << num << ' ' << *result);
+            }
+        } catch(const std::exception& e) {
+            dbg("[choke] throw " << num << e.what());
+            throw;
         }
     }
 
-    auto on_invoke(invoke_move_future future, const std::string& message) -> void_future {
-        auto ch = future.get();
+    auto on_invoke(invoke_move_future future, const std::string& message, const int id) -> void_future {
+        try {
+            dbg("[invoke] " << id);
+            auto ch = future.get();
 
-        auto rx = std::move(ch.rx);
-        auto tx = std::move(ch.tx);
+            auto rx = std::move(ch.rx);
+            auto tx = std::move(ch.tx);
 
-        dbg("[invoke] sending");
-        return tx.send<scope::chunk>(message)
-            .then(std::bind(on_send, ph::_1, rx))
-            .then(std::bind(on_chunk, ph::_1, rx))
-            .then(std::bind(on_choke, ph::_1));
+            dbg("[invoke] sending " << id);
+            return tx.send<scope::chunk>(message)
+                .then(std::bind(on_send, ph::_1, rx, id))
+                .then(std::bind(on_chunk, ph::_1, rx, id))
+                .then(std::bind(on_choke, ph::_1, id));
+        } catch(const std::exception& e) {
+            dbg("[invoke] throw " << id << ' ' << e.what());
+            throw;
+        }
     }
 
-    auto on_finalize(void_move_future future) -> void {
-        dbg("[finalize]");
-        future.get();
-        dbg("[finalize] done");
+    auto on_finalize(void_move_future future, const int id) -> void {
+        dbg("[finalize] " << id);
+        try {
+            future.get();
+        // } catch(...) {
+        } catch(const std::exception& e) {
+            dbg("[finalize] throw " << id << ' ' << e.what());
+            //dbg("[finalize] throw ");
+            throw;
+        }
+        dbg("[finalize] done "  << id);
     }
 }
 
@@ -104,18 +138,46 @@ auto mass_requests(Application&& client, const int iters, const std::string&even
 
     for(int i = 0; i < iters; ++i) {
         std::ostringstream os;
-        os << message << '_'<< (i+1);
+        auto id = i + 1;
+        os << message << '_' << id;
         auto f = client.template invoke<io::app::enqueue>(event)
-            .then(std::bind(app::on_invoke, ph::_1, os.str()))
-            .then(std::bind(app::on_finalize, ph::_1));
+            .then(std::bind(app::on_invoke, ph::_1, os.str(), id))
+            .then(std::bind(app::on_finalize, ph::_1, id));
 
         completions.push_back(std::move(f));
-        // std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    auto counter = int{};
     for(auto& f: completions) {
-        f.get();
+        try {
+            ++counter;
+            dbg("[completion] " << counter);
+
+            f.get();
+            dbg("[completion] done " << counter);
+        } catch(const std::exception& e) {
+            dbg("[error] completions " << counter << ' ' << e.what());
+        }
     }
+}
+
+
+auto make_service_manager(const int threads_count)
+    -> std::shared_ptr<fw::service_manager_t>
+{
+    auto manager = std::make_shared<fw::service_manager_t>(threads_count);
+    manager->shutdown_policy(fw::service_manager_t::shutdown_policy_t::force);
+
+    return manager;
+}
+
+auto make_client(fw::service_manager_t &manager, const std::string& app_name, bool hard_shutdown)
+    -> std::shared_ptr<fw::service<cocaine::io::app_tag>>
+{
+    auto cli = manager.create<cocaine::io::app_tag>(app_name);
+    cli.hard_shutdown(true);
+
+    return std::make_shared<fw::service<cocaine::io::app_tag>>(std::move(cli));
 }
 
 auto main(int argc, const char *argv[]) -> int try {
@@ -135,19 +197,35 @@ auto main(int argc, const char *argv[]) -> int try {
     const auto threads_count = args["threads"].as<int>(DEFAULT_THREADS_COUNT);
     const auto payload = args["payload"].as<std::string>("message");
 
-    fw::service_manager_t manager(threads_count);
+    auto manager = make_service_manager(threads_count);
+    auto cli = make_client(*manager, app_name, true);
 
-    auto cli = manager.create<cocaine::io::app_tag>(app_name);
-    cli.connect().then([&] (void_move_future f) {
-        f.get();
-        std::cerr << "[connect] done\n";
+    //
+    // TODO: make loops finite
+    //
+    auto cli_th = std::thread([&] {
+        while(true) {
+            mass_requests(*cli, iters, method_name, payload);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
     });
 
-    mass_requests(cli, iters, method_name, payload);
+    auto srv_th = std::thread([&] {
+        while(true) {
+            manager = make_service_manager(threads_count);
+            cli = make_client(*manager, app_name, true);
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        }
+    });
+
+
+    cli_th.join();
+    srv_th.join();
 
     std::cout << "Have a nice day.\n";
     return EXIT_SUCCESS;
 } catch(const std::exception& e) {
-    std::cerr << "[error] " << e.what() << '\n';
+    std::cerr << "[except] " << e.what() << '\n';
     return EXIT_FAILURE;
 }
