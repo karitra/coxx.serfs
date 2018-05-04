@@ -131,10 +131,10 @@ namespace app {
 
 
 template<typename Application>
-auto mass_requests(Application&& client, const int iters, const std::string&event, const std::string& message) -> void {
+auto mass_requests(Application&& client, const int iters, const std::string& event, const std::string& message) -> void {
     using task_type = fw::task<void>::future_type;
     std::vector<task_type> completions;
-    completions.reserve(ITERS);
+    completions.reserve(iters);
 
     for(int i = 0; i < iters; ++i) {
         std::ostringstream os;
@@ -209,6 +209,8 @@ auto main(int argc, const char *argv[]) -> int try {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10 * 1000));
 
     auto srv_th = std::thread([&] {
         while(true) {
